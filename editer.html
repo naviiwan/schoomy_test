@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>スクーミー Webインタプリタ</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    header { padding: 14px 16px; border-bottom: 1px solid #ddd; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    .pill { padding: 6px 10px; border-radius: 999px; background:#eee; font-size: 12px; }
+    .ok { background:#c8f7d2; }
+    .ng { background:#ffd0d0; }
+    button { padding: 10px 12px; font-size: 14px; }
+    main { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
+    textarea { width: 100%; height: calc(100vh - 120px); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+               font-size: 14px; line-height: 1.4; padding: 10px; border:1px solid #ccc; border-radius: 10px; }
+    #log { height: calc(100vh - 120px); white-space: pre-wrap; overflow:auto; padding: 10px; border:1px solid #ccc; border-radius: 10px;
+           background:#0f1220; color:#d9defa; font-family: ui-monospace, monospace; font-size: 13px; }
+    .hint { padding: 0 12px 12px; color:#555; font-size: 13px; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } textarea, #log { height: 40vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>スクーミー Webインタプリタ</strong>
+    <span id="status" class="pill ng">DISCONNECTED</span>
+
+    <button id="btnConnect">接続</button>
+    <button id="btnSend">送信（そのまま）</button>
+    <button id="btnRun">実行（行ごと）</button>
+    <button id="btnStop" disabled>停止</button>
+    <button id="btnClear">ログ消去</button>
+  </header>
+
+  <div class="hint">
+    例：<code>PING</code>, <code>LED 13 ON</code>, <code>WAIT 200</code>, <code>LED 13 OFF</code>, <code>BTN</code>, <code>DIGITAL 19 READ</code>, <code>COUNT</code>
+  </div>
+
+  <main>
+    <textarea id="editor">PING
+LED 13 ON
+WAIT 200
+LED 13 OFF
+COUNT
+BTN
+</textarea>
+    <div id="log"></div>
+  </main>
+
+<script>
+let port = null;
+let reader = null;
+let writer = null;
+let readBuffer = "";
+let runAbort = false;
+
+const $ = (id) => document.getElementById(id);
+const log = (msg) => {
+  const el = $("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+};
+
+function setStatus(connected) {
+  const s = $("status");
+  s.textContent = connected ? "CONNECTED" : "DISCONNECTED";
+  s.className = "pill " + (connected ? "ok" : "ng");
+}
+
+async function connect() {
+  if (!("serial" in navigator)) {
+    alert("Web Serial非対応です。Chrome / Edge を使ってください。");
+    return;
+  }
+  if (port) return;
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+
+    // writer
+    writer = port.writable.getWriter();
+
+    // reader
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable);
+    reader = decoder.readable.getReader();
+
+    setStatus(true);
+    log("[SYS] Connected");
+    readLoop();
+  } catch (e) {
+    log("[SYS] Connect failed: " + e);
+    await cleanup();
+  }
+}
+
+async function cleanup() {
+  setStatus(false);
+  try { reader?.releaseLock(); } catch {}
+  try { writer?.releaseLock(); } catch {}
+  try { await port?.close(); } catch {}
+  reader = null; writer = null; port = null;
+}
+
+async function readLoop() {
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      readBuffer += value;
+      let idx;
+      while ((idx = readBuffer.indexOf("\n")) >= 0) {
+        const line = readBuffer.slice(0, idx).replace(/\r/g, "").trimEnd();
+        readBuffer = readBuffer.slice(idx + 1);
+        if (line.length) log("[RX] " + line);
+      }
+    }
+  } catch (e) {
+    log("[SYS] Read error: " + e);
+  } finally {
+    log("[SYS] Disconnected");
+    await cleanup();
+  }
+}
+
+async function sendRaw(text) {
+  if (!writer) { alert("先に接続してください"); return; }
+  // 必ず末尾改行（ファームは \n で1命令確定）
+  if (!text.endsWith("\n")) text += "\n";
+  await writer.write(new TextEncoder().encode(text));
+  log("[TX] " + text.replace(/\n/g, "\\n"));
+}
+
+async function runLineByLine(code) {
+  if (!writer) { alert("先に接続してください"); return; }
+
+  runAbort = false;
+  $("btnStop").disabled = false;
+  $("btnRun").disabled = true;
+
+  const lines = code.split(/\n/).map(s => s.trim()).filter(s => s.length && !s.startsWith("//") && !s.startsWith("#"));
+
+  for (const line of lines) {
+    if (runAbort) break;
+    await sendRaw(line);
+
+    // ちょい待ち（連射すると受信が追いつかない時がある）
+    await new Promise(r => setTimeout(r, 30));
+  }
+
+  $("btnStop").disabled = true;
+  $("btnRun").disabled = false;
+  if (runAbort) log("[SYS] Run stopped");
+  else log("[SYS] Run done");
+}
+
+$("btnConnect").addEventListener("click", connect);
+
+$("btnSend").addEventListener("click", async () => {
+  const code = $("editor").value;
+  await sendRaw(code); // そのまま送る（改行含む）
+});
+
+$("btnRun").addEventListener("click", async () => {
+  await runLineByLine($("editor").value);
+});
+
+$("btnStop").addEventListener("click", () => {
+  runAbort = true;
+});
+
+$("btnClear").addEventListener("click", () => {
+  $("log").textContent = "";
+});
+
+</script>
+</body>
+</html>
